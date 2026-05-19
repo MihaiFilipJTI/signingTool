@@ -1,0 +1,49 @@
+trigger: none
+pr: none
+
+parameters:
+  - name: inputPath
+    displayName: "Absolute path to input (.xcarchive or .ipa)"
+    type: string
+  - name: outputDir
+    displayName: "Absolute output directory for IPA export"
+    type: string
+    default: "$(Build.SourcesDirectory)/output"
+
+pool:
+  vmImage: "macos-latest"
+
+steps:
+  - checkout: self
+
+  - task: Bash@3
+    displayName: "Install fastlane"
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        gem install fastlane --no-document
+
+  - task: Bash@3
+    displayName: "Sign and export IPA"
+    env:
+      ASC_KEY_ID: $(ASC_KEY_ID)
+      ASC_ISSUER_ID: $(ASC_ISSUER_ID)
+      ASC_PRIVATE_KEY_BASE64: $(ASC_PRIVATE_KEY_BASE64)
+      APPLE_TEAM_ID: $(APPLE_TEAM_ID)
+      SIGNING_IDENTITY: $(SIGNING_IDENTITY)
+      BUMP_VERSION: $(BUMP_VERSION)
+      BUMP_BUILD: $(BUMP_BUILD)
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        chmod +x "$(Build.SourcesDirectory)/scripts/sign_and_export.sh"
+        "$(Build.SourcesDirectory)/scripts/sign_and_export.sh" "${{ parameters.inputPath }}" "${{ parameters.outputDir }}"
+
+  - task: PublishBuildArtifacts@1
+    displayName: "Publish signed IPA"
+    inputs:
+      PathtoPublish: "${{ parameters.outputDir }}"
+      ArtifactName: "signed-ipa"
+      publishLocation: "Container"
