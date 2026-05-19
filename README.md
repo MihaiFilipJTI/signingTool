@@ -1,4 +1,4 @@
-# signingTool
+# Automatic Signing
 
 Automatic Apple signing tool for CI/CD usage.
 
