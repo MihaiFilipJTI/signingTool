@@ -2,19 +2,155 @@ trigger: none
 pr: none
 
 parameters:
-  - name: inputPath
-    displayName: "Absolute path to input (.xcarchive or .ipa)"
+  - name: inputSource
+    displayName: "Input source"
     type: string
+    default: "secureFile"
+    values:
+      - secureFile
+      - localPath
+      - blobUrl
+  - name: secureFileName
+    displayName: "Secure File name (.ipa or .xcarchive.zip) — upload via Library > Secure Files"
+    type: string
+    default: ""
+  - name: inputPath
+    displayName: "Local path to input (used only when inputSource is 'localPath')"
+    type: string
+    default: ""
+  - name: blobUrl
+    displayName: "Blob URL (used only when inputSource is 'blobUrl' — set by upload portal)"
+    type: string
+    default: ""
+  - name: blobName
+    displayName: "Blob file name (informational, used only when inputSource is 'blobUrl')"
+    type: string
+    default: ""
   - name: outputDir
     displayName: "Absolute output directory for IPA export"
     type: string
     default: "$(Build.SourcesDirectory)/output"
+  - name: versionAction
+    displayName: "Version action (bump or manual)"
+    type: string
+    default: "none"
+    values:
+      - none
+      - major
+      - minor
+      - patch
+      - manual
+  - name: manualVersion
+    displayName: "Manual version (used only when versionAction is 'manual')"
+    type: string
+    default: ""
 
 pool:
   vmImage: "macos-latest"
 
 steps:
   - checkout: self
+
+  - task: DownloadSecureFile@1
+    condition: eq('${{ parameters.inputSource }}', 'secureFile')
+    name: vendorArtifact
+    displayName: "Download vendor artifact from Secure Files"
+    inputs:
+      secureFile: ${{ parameters.secureFileName }}
+
+  - task: Bash@3
+    condition: eq('${{ parameters.inputSource }}', 'secureFile')
+    displayName: "Prepare uploaded artifact"
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        SECURE_PATH="$(vendorArtifact.secureFilePath)"
+        DEST_DIR="$(Build.SourcesDirectory)/vendor-input"
+        mkdir -p "$DEST_DIR"
+
+        if [[ "$SECURE_PATH" == *.ipa ]]; then
+          cp "$SECURE_PATH" "$DEST_DIR/"
+          RESOLVED_PATH="$DEST_DIR/$(basename "$SECURE_PATH")"
+        elif [[ "$SECURE_PATH" == *.xcarchive.zip ]]; then
+          unzip -q "$SECURE_PATH" -d "$DEST_DIR"
+          RESOLVED_PATH="$(find "$DEST_DIR" -maxdepth 1 -name '*.xcarchive' | head -n 1)"
+          if [ -z "$RESOLVED_PATH" ]; then
+            echo "##vso[task.logissue type=error]No .xcarchive found inside the uploaded zip"
+            exit 1
+          fi
+        else
+          echo "##vso[task.logissue type=error]Unsupported secure file type. Upload a .ipa or .xcarchive.zip"
+          exit 1
+        fi
+
+        echo "Resolved input path: $RESOLVED_PATH"
+        echo "##vso[task.setvariable variable=RESOLVED_INPUT_PATH]$RESOLVED_PATH"
+
+  - task: Bash@3
+    condition: eq('${{ parameters.inputSource }}', 'localPath')
+    displayName: "Set local input path"
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        if [ -z "${{ parameters.inputPath }}" ]; then
+          echo "##vso[task.logissue type=error]inputPath is required when inputSource is 'localPath'"
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=RESOLVED_INPUT_PATH]${{ parameters.inputPath }}"
+
+  - task: AzureCLI@2
+    condition: eq('${{ parameters.inputSource }}', 'blobUrl')
+    displayName: "Download artifact from Azure Blob"
+    inputs:
+      azureSubscription: $(AZURE_SUBSCRIPTION_SERVICE_CONNECTION)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        set -euo pipefail
+        BLOB_URL="${{ parameters.blobUrl }}"
+        BLOB_NAME="${{ parameters.blobName }}"
+        if [ -z "$BLOB_URL" ]; then
+          echo "##vso[task.logissue type=error]blobUrl is required when inputSource is 'blobUrl'"
+          exit 1
+        fi
+
+        DEST_DIR="$(Build.SourcesDirectory)/vendor-input"
+        mkdir -p "$DEST_DIR"
+        FILE_NAME="${BLOB_NAME:-$(basename "$BLOB_URL")}"
+        DEST_PATH="$DEST_DIR/$FILE_NAME"
+
+        # Parse account + container + blob path from URL
+        # Format: https://<account>.blob.core.windows.net/<container>/<blob>
+        ACCOUNT=$(echo "$BLOB_URL" | sed -E 's#https?://([^.]+)\..*#\1#')
+        REST=$(echo "$BLOB_URL" | sed -E 's#https?://[^/]+/##')
+        CONTAINER=$(echo "$REST" | cut -d/ -f1)
+        BLOB_PATH=$(echo "$REST" | cut -d/ -f2-)
+
+        az storage blob download \
+          --account-name "$ACCOUNT" \
+          --container-name "$CONTAINER" \
+          --name "$BLOB_PATH" \
+          --file "$DEST_PATH" \
+          --auth-mode login
+
+        if [[ "$FILE_NAME" == *.ipa ]]; then
+          RESOLVED_PATH="$DEST_PATH"
+        elif [[ "$FILE_NAME" == *.zip ]]; then
+          unzip -q "$DEST_PATH" -d "$DEST_DIR"
+          RESOLVED_PATH="$(find "$DEST_DIR" -maxdepth 1 -name '*.xcarchive' | head -n 1)"
+          if [ -z "$RESOLVED_PATH" ]; then
+            echo "##vso[task.logissue type=error]No .xcarchive found inside the downloaded zip"
+            exit 1
+          fi
+        else
+          echo "##vso[task.logissue type=error]Unsupported file: $FILE_NAME"
+          exit 1
+        fi
+
+        echo "Resolved input path: $RESOLVED_PATH"
+        echo "##vso[task.setvariable variable=RESOLVED_INPUT_PATH]$RESOLVED_PATH"
 
   - task: Bash@3
     displayName: "Install fastlane"
@@ -23,6 +159,54 @@ steps:
       script: |
         set -euo pipefail
         gem install fastlane --no-document
+
+  - task: Bash@3
+    displayName: "Resolve version"
+    inputs:
+      targetType: inline
+      script: |
+        set -euo pipefail
+        ACTION="${{ parameters.versionAction }}"
+        MANUAL_VERSION="${{ parameters.manualVersion }}"
+
+        if [ "$ACTION" = "none" ]; then
+          echo "No version change requested."
+          echo "##vso[task.setvariable variable=BUMP_VERSION]"
+        elif [ "$ACTION" = "manual" ]; then
+          if [ -z "$MANUAL_VERSION" ]; then
+            echo "##vso[task.logissue type=error]manualVersion parameter is required when versionAction is 'manual'"
+            exit 1
+          fi
+          echo "Setting manual version: $MANUAL_VERSION"
+          echo "##vso[task.setvariable variable=BUMP_VERSION]$MANUAL_VERSION"
+        else
+          # Bump from current Info.plist version inside the archive/IPA
+          INPUT_PATH="$(RESOLVED_INPUT_PATH)"
+          PLIST=""
+          if [[ "$INPUT_PATH" == *.xcarchive ]]; then
+            PLIST="${INPUT_PATH}/Info.plist"
+            CURRENT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :ApplicationProperties:CFBundleShortVersionString" "$PLIST")
+          elif [[ "$INPUT_PATH" == *.ipa ]]; then
+            WORK_DIR="$(mktemp -d)"
+            unzip -q "$INPUT_PATH" -d "$WORK_DIR"
+            APP_PATH="$(find "$WORK_DIR/Payload" -maxdepth 1 -name "*.app" | head -n 1)"
+            PLIST="${APP_PATH}/Info.plist"
+            CURRENT_VERSION=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST")
+          else
+            echo "##vso[task.logissue type=error]Unsupported input format for version bump"
+            exit 1
+          fi
+
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+          case "$ACTION" in
+            major) MAJOR=$((MAJOR + 1)); MINOR=0; PATCH=0 ;;
+            minor) MINOR=$((MINOR + 1)); PATCH=0 ;;
+            patch) PATCH=$((PATCH + 1)) ;;
+          esac
+          NEW_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+          echo "Bumped version: $CURRENT_VERSION -> $NEW_VERSION"
+          echo "##vso[task.setvariable variable=BUMP_VERSION]$NEW_VERSION"
+        fi
 
   - task: Bash@3
     displayName: "Sign and export IPA"
@@ -39,7 +223,7 @@ steps:
       script: |
         set -euo pipefail
         chmod +x "$(Build.SourcesDirectory)/scripts/sign_and_export.sh"
-        "$(Build.SourcesDirectory)/scripts/sign_and_export.sh" "${{ parameters.inputPath }}" "${{ parameters.outputDir }}"
+        "$(Build.SourcesDirectory)/scripts/sign_and_export.sh" "$(RESOLVED_INPUT_PATH)" "${{ parameters.outputDir }}"
 
   - task: PublishBuildArtifacts@1
     displayName: "Publish signed IPA"
